@@ -98,7 +98,7 @@ def build_rollout(model, tokenizer, dataset, indices, generations):
         prompts.append(prompt)
         answers += [answer] * generations
     max_len = max(len(p) for p in prompts)
-    padded_prompts = [[0] * (max_len - len(p)) + p for p in prompts]
+    padded_prompts = [[151645] * (max_len - len(p)) + p for p in prompts]
     mask = mx.full([generations * len(indices), len(padded_prompts[0]) + 1], True)
     ended = mx.repeat(mx.array(False), generations * len(indices))
     cache = kv_cache.make_prompt_cache(model)
@@ -148,6 +148,7 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
     decoded = tokenizer.batch_decode(responses.tolist())
     decoded_prompts = tokenizer.batch_decode(prompts.tolist())
     for a, d, p in zip(answers, decoded, decoded_prompts):
+        print("".join(p.split("<im_start>")[1:]))
         print(p + d.split("<|im_end|>")[0])
         print("---------")
         print(a)
