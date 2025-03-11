@@ -9,7 +9,7 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 from datasets import load_dataset
 
-max_tokens = 1024
+max_tokens = 512
 epsilon = 1e-6
 temperature = 0.9
 batch_size = 2
@@ -105,7 +105,7 @@ def build_rollout(model, tokenizer, dataset, indices, generations):
     logits = []
     for i in padded_prompts:
         temp_cache = kv_cache.make_prompt_cache(model)
-        logit = model([prompt], cache=temp_cache)
+        logit = model([i], cache=temp_cache)
         for t, c in zip(temp_cache, cache):
             c.keys = mx.concat(
                 [c.keys, mx.repeat(t.keys, generations, 0)]
