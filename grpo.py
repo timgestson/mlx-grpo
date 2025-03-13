@@ -20,6 +20,7 @@ learning_rate = 1e-5
 mu = 1
 gradient_accumulation_steps = 2
 gradient_checkpoints = 2
+safetensor_file = "qwen-rl.safetensors"
 
 optimizer = optim.AdamW(
     learning_rate=learning_rate, betas=[0.9, 0.95], weight_decay=0.1
@@ -280,7 +281,7 @@ def train(weights=None):
         mx.eval(model.parameters(), optimizer.state)
 
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-        mx.save_safetensors("qwen-rl7b.safetensors", adapter_weights)
+        mx.save_safetensors(safetensor_file, adapter_weights)
 
 
 train()
