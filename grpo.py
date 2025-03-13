@@ -244,7 +244,7 @@ def train(weights=None):
 
     for step in range(0, 500, batch_size):
         print("Generating set")
-        gens, averageReward = create_generations(
+        gens, avg_reward = create_generations(
             model,
             ref_model,
             tokenizer,
@@ -252,7 +252,7 @@ def train(weights=None):
             generations,
             range(step, step + batch_size),
         )
-        run.log({"avg_reward": averageReward.item()})
+        run.log({"avg_reward": avg_reward.item()})
 
         value_and_grad_fn = nn.value_and_grad(model, grpo_loss)
         for _ in range(mu):
