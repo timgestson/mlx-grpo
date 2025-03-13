@@ -1,12 +1,14 @@
 import re
+import math
 import wandb
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load
 from mlx_lm.tuner.trainer import grad_checkpoint
 from mlx_lm.models import cache as kv_cache
+from mlx_lm.models.base import create_attention_mask
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 from datasets import load_dataset
 
 max_tokens = 512
@@ -14,6 +16,14 @@ epsilon = 1e-6
 temperature = 0.9
 batch_size = 2
 generations = 16
+learning_rate = 1e-5
+mu = 1
+gradient_accumulation_steps = 2
+gradient_checkpoints = 2
+
+optimizer = optim.AdamW(
+    learning_rate=learning_rate, betas=[0.9, 0.95], weight_decay=0.1
+)
 
 system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
 The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
@@ -99,13 +109,17 @@ def build_rollout(model, tokenizer, dataset, indices, generations):
         answers += [answer] * generations
     max_len = max(len(p) for p in prompts)
     padded_prompts = [[151645] * (max_len - len(p)) + p for p in prompts]
+    pad_lengths = [(max_len - len(p)) for p in prompts]
     mask = mx.full([generations * len(indices), len(padded_prompts[0]) + 1], True)
     ended = mx.repeat(mx.array(False), generations * len(indices))
     cache = kv_cache.make_prompt_cache(model)
     logits = []
-    for i in padded_prompts:
+    for i, l in zip(padded_prompts, pad_lengths):
+        causal_mask = (create_attention_mask(mx.zeros((0,len(i)))))
+        causal_mask[:,0:l] = -math.inf
+        causal_mask = causal_mask.astype(mx.bfloat16)
         temp_cache = kv_cache.make_prompt_cache(model)
-        logit = model([i], cache=temp_cache)
+        logit = model([i], cache=temp_cache, mask=causal_mask)
         for t, c in zip(temp_cache, cache):
             c.keys = mx.concat(
                 [c.keys, mx.repeat(t.keys, generations, 0)]
@@ -148,8 +162,8 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
     decoded = tokenizer.batch_decode(responses.tolist())
     decoded_prompts = tokenizer.batch_decode(prompts.tolist())
     for a, d, p in zip(answers, decoded, decoded_prompts):
-        print("".join(p.split("<im_start>")[1:]))
-        print(p + d.split("<|im_end|>")[0])
+        print(p.replace("<|im_end|>",""))
+        print(d.split("<|im_end|>")[0])
         print("---------")
         print(a)
 
@@ -175,7 +189,7 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
     }, baseline
 
 
-def grpo_loss(model, tokens, response_mask, advantages, ref_log_probs):
+def grpo_loss(model, tokens, response_mask, advantages, ref_log_probs, gradient_accumulation_steps):
     beta = 0.4
     logits = model(tokens)[:, :-1, :]
     current_log_probs = selective_softmax(logits, tokens[:, 1:])
@@ -206,7 +220,7 @@ def grpo_loss(model, tokens, response_mask, advantages, ref_log_probs):
     # Compute the loss as the negative mean of the weighted log probabilities (maximize advantage)
     loss = -mx.mean(sequence_weighted_log_probs)
 
-    return loss
+    return loss / gradient_accumulation_steps
 
 
 def train(weights=None):
@@ -222,16 +236,12 @@ def train(weights=None):
 
     dataset = load_dataset("openai/gsm8k", "main")["train"]
     dataset.shuffle()
-    grad_checkpoint(model.layers[0])
-
-    learning_rate = 1e-5
-    optimizer = optim.AdamW(
-        learning_rate=learning_rate, betas=[0.9, 0.95], weight_decay=0.1
-    )
+    for i in range(0, len(model.layers), gradient_checkpoints):
+        grad_checkpoint(model.layers[i])
 
     run = wandb.init()
 
-    for step in range(0, 100, batch_size):
+    for step in range(0, 500, batch_size):
         print("Generating set")
         gens, averageReward = create_generations(
             model,
@@ -241,16 +251,36 @@ def train(weights=None):
             generations,
             range(step, step + batch_size),
         )
+        run.log({"avg_reward": averageReward.item()})
 
         value_and_grad_fn = nn.value_and_grad(model, grpo_loss)
-        loss, grads = value_and_grad_fn(model, **gens)
-        run.log({"avg_reward": averageReward.item(), "loss": loss.item()})
+        for _ in range(mu):
+            total_loss = 0
+            for j in range(gradient_accumulation_steps):
+                indices = mx.random.randint(low=0, high=generations*batch_size, shape=(generations * batch_size // gradient_accumulation_steps,gradient_accumulation_steps))
+                # Save Memory Accumulate Gradients
+                accumulated_grads = None
+                loss, grads = value_and_grad_fn(
+                    model,
+                    gens["tokens"][indices[j],:],
+                    gens["response_mask"][indices[j],:],
+                    gens["advantages"][indices[j]],
+                    gens["ref_log_probs"][indices[j],:],
+                    gradient_accumulation_steps
+                )
+                total_loss += loss
+                if accumulated_grads:
+                    grads = tree_flatten(grads)
+                    accumulated_grads = [ (k1, v1 + v2) for (k1,v1),(k1,v2) in zip(grads, accumulated_grads)]
+                else:
+                    accumulated_grads = tree_flatten(grads)
 
-        optimizer.update(model, grads)
+            run.log({"loss": total_loss.item()})
+            optimizer.update(model, tree_unflatten(accumulated_grads))
         mx.eval(model.parameters(), optimizer.state)
 
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-        mx.save_safetensors(f"qwen-rl.safetensors", adapter_weights)
+        mx.save_safetensors("qwen-rl7b.safetensors", adapter_weights)
 
 
 train()
