@@ -20,7 +20,7 @@ generations = 16
 learning_rate = 5e-6
 mu = 1
 gradient_checkpoints = 4
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 8
 safetensor_file = "qwen-rl.safetensors"
 
 optimizer = optim.AdamW(
