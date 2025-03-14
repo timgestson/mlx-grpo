@@ -13,13 +13,14 @@ from datasets import load_dataset
 
 max_tokens = 512
 epsilon = 1e-6
-temperature = 0.9
-batch_size = 2
+beta = 0.1
+temperature = 0.8
+batch_size = 4
 generations = 16
-learning_rate = 1e-5
+learning_rate = 5e-6
 mu = 1
+gradient_checkpoints = 4
 gradient_accumulation_steps = 2
-gradient_checkpoints = 2
 safetensor_file = "qwen-rl.safetensors"
 
 optimizer = optim.AdamW(
@@ -47,8 +48,13 @@ def answer_reward(text, answer):
     return (
         1
         if match and match.group(1).strip() == answer
-        else 0.5 if match and answer in match.group(1).strip() else 0
+        else 0.25 if match and answer in match.group(1).strip() else 0
     )
+
+
+def digit_reward(text, _answer):
+    match = re.search(rf"<answer>\s*(.*?)\s*</answer>", text, re.DOTALL)
+    return 0.25 if match and match.group(1).strip().isdigit() else 0
 
 
 def sample(logits, temp, top_p):
@@ -116,8 +122,8 @@ def build_rollout(model, tokenizer, dataset, indices, generations):
     cache = kv_cache.make_prompt_cache(model)
     logits = []
     for i, l in zip(padded_prompts, pad_lengths):
-        causal_mask = (create_attention_mask(mx.zeros((0,len(i)))))
-        causal_mask[:,0:l] = -math.inf
+        causal_mask = create_attention_mask(mx.zeros((0, len(i))))
+        causal_mask[:, 0:l] = -math.inf
         causal_mask = causal_mask.astype(mx.bfloat16)
         temp_cache = kv_cache.make_prompt_cache(model)
         logit = model([i], cache=temp_cache, mask=causal_mask)
@@ -163,7 +169,7 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
     decoded = tokenizer.batch_decode(responses.tolist())
     decoded_prompts = tokenizer.batch_decode(prompts.tolist())
     for a, d, p in zip(answers, decoded, decoded_prompts):
-        print(p.replace("<|im_end|>",""))
+        print(p.replace("<|im_end|>", ""))
         print(d.split("<|im_end|>")[0])
         print("---------")
         print(a)
@@ -172,6 +178,7 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
         [
             format_reward(response.split("<|im_end|>")[0], answer)
             + answer_reward(response.split("<|im_end|>")[0], answer)
+            + digit_reward(response.split("<|im_end|>")[0], answer)
             for response, answer in zip(decoded, answers)
         ]
     )
@@ -190,8 +197,9 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
     }, baseline
 
 
-def grpo_loss(model, tokens, response_mask, advantages, ref_log_probs, gradient_accumulation_steps):
-    beta = 0.4
+def grpo_loss(
+    model, tokens, response_mask, advantages, ref_log_probs, gradient_accumulation_steps
+):
     logits = model(tokens)[:, :-1, :]
     current_log_probs = selective_softmax(logits, tokens[:, 1:])
 
@@ -211,7 +219,7 @@ def grpo_loss(model, tokens, response_mask, advantages, ref_log_probs, gradient_
     # Apply response mask to focus only on response tokens
     masked_weighted_log_probs = (
         weighted_log_probs - kl
-    ) * response_mask  # .astype(mx.float32)  # Shape: [batch_size, sequence_length - 1]
+    ) * response_mask  # Shape: [batch_size, sequence_length - 1]
     sequence_weighted_log_probs = mx.sum(
         masked_weighted_log_probs, axis=1
     ) / mx.maximum(
@@ -237,13 +245,14 @@ def train(weights=None):
 
     dataset = load_dataset("openai/gsm8k", "main")["train"]
     dataset.shuffle()
-    for i in range(0, len(model.layers), gradient_checkpoints):
+    for i in range(0, len(model.layers), len(model.layers) // gradient_checkpoints):
         grad_checkpoint(model.layers[i])
 
     run = wandb.init()
+    value_and_grad_fn = nn.value_and_grad(model, grpo_loss)
 
     for step in range(0, 500, batch_size):
-        print("Generating set")
+        print("Generating rollout")
         gens, avg_reward = create_generations(
             model,
             ref_model,
@@ -252,33 +261,40 @@ def train(weights=None):
             generations,
             range(step, step + batch_size),
         )
+        print("Average Reward: ", avg_reward.item())
         run.log({"avg_reward": avg_reward.item()})
 
-        value_and_grad_fn = nn.value_and_grad(model, grpo_loss)
         for _ in range(mu):
             total_loss = 0
             for j in range(gradient_accumulation_steps):
-                indices = mx.random.randint(low=0, high=generations*batch_size, shape=(generations * batch_size // gradient_accumulation_steps,gradient_accumulation_steps))
+                indices = mx.arange(generations * batch_size).reshape(
+                    generations * batch_size // gradient_accumulation_steps,
+                    gradient_accumulation_steps,
+                )
                 # Save Memory Accumulate Gradients
                 accumulated_grads = None
                 loss, grads = value_and_grad_fn(
                     model,
-                    gens["tokens"][indices[j],:],
-                    gens["response_mask"][indices[j],:],
+                    gens["tokens"][indices[j], :],
+                    gens["response_mask"][indices[j], :],
                     gens["advantages"][indices[j]],
-                    gens["ref_log_probs"][indices[j],:],
-                    gradient_accumulation_steps
+                    gens["ref_log_probs"][indices[j], :],
+                    gradient_accumulation_steps,
                 )
                 total_loss += loss
                 if accumulated_grads:
                     grads = tree_flatten(grads)
-                    accumulated_grads = [ (k1, v1 + v2) for (k1,v1),(k1,v2) in zip(grads, accumulated_grads)]
+                    accumulated_grads = [
+                        (k1, v1 + v2)
+                        for (k1, v1), (k1, v2) in zip(grads, accumulated_grads)
+                    ]
                 else:
                     accumulated_grads = tree_flatten(grads)
-
+                mx.eval(model.parameters(), grads)
             run.log({"loss": total_loss.item()})
-            optimizer.update(model, tree_unflatten(accumulated_grads))
-        mx.eval(model.parameters(), optimizer.state)
+            print("loss: ", total_loss.item())
+            optimizer.update(model.parameters(), grads)
+            mx.eval(model.parameters(), optimizer.state)
 
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(safetensor_file, adapter_weights)
