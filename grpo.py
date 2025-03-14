@@ -293,7 +293,7 @@ def train(weights=None):
                 mx.eval(model.parameters(), grads)
             run.log({"loss": total_loss.item()})
             print("loss: ", total_loss.item())
-            optimizer.update(model.parameters(), grads)
+            optimizer.update(model.parameters(), tree_unflatten(accumulated_grads))
             mx.eval(model.parameters(), optimizer.state)
 
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
