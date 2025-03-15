@@ -13,14 +13,14 @@ from datasets import load_dataset
 
 max_tokens = 512
 epsilon = 1e-6
-beta = 0.1
+beta = 0.4
 temperature = 0.8
-batch_size = 4
+batch_size = 2
 generations = 16
 learning_rate = 5e-6
 mu = 1
-gradient_checkpoints = 4
-gradient_accumulation_steps = 8
+gradient_checkpoints = 1
+gradient_clipping=0.1
 safetensor_file = "qwen-rl.safetensors"
 
 optimizer = optim.AdamW(
@@ -40,7 +40,7 @@ def format_reward(text, _answer):
     pattern = r"^.*?<think>.*?</think>.*?<answer>.*?</answer>.*?$"
     matches_format = bool(re.search(pattern, text, re.DOTALL))
 
-    return 0.5 if (has_correct_structure and matches_format) else 0
+    return 0.5 if (has_correct_structure and matches_format) else -0.5
 
 
 def answer_reward(text, answer):
@@ -48,7 +48,7 @@ def answer_reward(text, answer):
     return (
         1
         if match and match.group(1).strip() == answer
-        else 0.25 if match and answer in match.group(1).strip() else 0
+        else 0.5 if match and answer in match.group(1).strip() else 0
     )
 
 
@@ -150,11 +150,11 @@ def build_rollout(model, tokenizer, dataset, indices, generations):
             for p in padded_prompts
         ]
     )
-    return cache, tokens, responses, answers, mask, ended, prompts
+    return cache, tokens, responses, answers, mask, ended, prompts, pad_lengths
 
 
 def create_generations(model, ref_model, tokenizer, dataset, generations, indices):
-    cache, tokens, responses, answers, mask, ended, prompts = build_rollout(
+    cache, tokens, responses, answers, mask, ended, prompts, pad_lengths = build_rollout(
         model, tokenizer, dataset, indices, generations
     )
     for _ in range(max_tokens):
@@ -181,32 +181,37 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
             + digit_reward(response.split("<|im_end|>")[0], answer)
             for response, answer in zip(decoded, answers)
         ]
-    )
-    baseline = mx.mean(rewards)
+    ).reshape(len(prompts) // generations, generations)
+    baseline = mx.expand_dims(mx.mean(rewards, axis=1),1)
     std = mx.sqrt(mx.mean(mx.square(rewards - baseline)) + epsilon)
-    advantages = (rewards - baseline) / (std + epsilon)
+    advantages = mx.expand_dims(mx.array((rewards - baseline) / (std + epsilon)).reshape(len(prompts),),1)
     full_prompts = mx.concat([prompts, responses], 1)
 
-    logits = ref_model(full_prompts)
+    attention_mask = create_attention_mask(full_prompts)
+    for i,p in enumerate(pad_lengths):
+        attention_mask[i:i+generations, 0:p] = -math.inf
+    attention_mask = attention_mask.astype(mx.bfloat16)
+
+    logits = ref_model(full_prompts, mask=attention_mask)
     ref_log_probs = selective_softmax(logits[:, :-1, :], full_prompts[:, 1:])
     return {
         "tokens": full_prompts,
+        "attention_mask": attention_mask,
         "response_mask": mx.logical_not(mask)[:, 1:],
         "advantages": advantages,
         "ref_log_probs": ref_log_probs,
-    }, baseline
+    }, baseline.mean()
 
 
 def grpo_loss(
-    model, tokens, response_mask, advantages, ref_log_probs, gradient_accumulation_steps
+    model, tokens, response_mask, attention_mask, advantages, ref_log_probs
 ):
-    logits = model(tokens)[:, :-1, :]
+    logits = model(tokens, mask=attention_mask)[:, :-1, :]
     current_log_probs = selective_softmax(logits, tokens[:, 1:])
 
     # Expand advantages to match sequence length
-    advantages_expanded = mx.expand_dims(advantages, 1)
     advantages_expanded = mx.repeat(
-        advantages_expanded, current_log_probs.shape[1], axis=1
+        advantages, current_log_probs.shape[1], axis=1
     )
 
     # Weight log probabilities by advantages
@@ -229,7 +234,52 @@ def grpo_loss(
     # Compute the loss as the negative mean of the weighted log probabilities (maximize advantage)
     loss = -mx.mean(sequence_weighted_log_probs)
 
-    return loss / gradient_accumulation_steps
+    return loss
+
+def generate_evaluation(model, dataset, tokenizer, generations, indices):
+    cache, tokens, responses, answers, mask, ended, _, _ = build_rollout(
+        model, tokenizer, dataset, indices, generations
+    )
+    for _ in range(max_tokens):
+        tokens, _ = sample(
+            model(mx.expand_dims(tokens, 1), cache=cache)[:, -1, :], temperature, 5
+        )
+        ended = mx.logical_or(ended, mx.equal(tokens, 151645))
+        mask = mx.concat([mask, mx.expand_dims(ended, 1)], 1)
+        responses = mx.concat([responses, mx.expand_dims(tokens, 1)], 1)
+        if mx.all(ended):
+            break
+    decoded = tokenizer.batch_decode(responses.tolist())
+    format = mx.mean(mx.array([
+        format_reward(response.split("<|im_end|>")[0], answer)
+        for response, answer in zip(decoded, answers)
+    ])).item()
+    digit = mx.mean(mx.array([
+        digit_reward(response.split("<|im_end|>")[0], answer)
+        for response, answer in zip(decoded, answers)
+    ])).item()
+    answer = mx.mean(mx.array([
+        answer_reward(response.split("<|im_end|>")[0], answer)
+        for response, answer in zip(decoded, answers)
+    ])).item()
+    return format + digit + answer, format, digit, answer
+
+def evaluate(ref_model, model, dataset, tokenizer, generations, indices):
+    rewards, format, digit, answer = generate_evaluation(ref_model, dataset, tokenizer, generations, indices)
+    print("Evaluation:")
+    print("-------")
+    print("Reference Model Rewards:")
+    print("Format: ",format)
+    print("Digit Rewards:", digit)
+    print("Answer Rewards:", answer)
+    print("Total Rewards: ", rewards)
+    rewards, format, digit, answer = generate_evaluation(model, dataset, tokenizer, generations, indices)
+    print("-------")
+    print("Trained Model Rewards:")
+    print("Format: ",format)
+    print("Digit Rewards:", digit)
+    print("Answer Rewards:", answer)
+    print("Total Rewards: ", rewards)
 
 
 def train(weights=None):
@@ -244,14 +294,28 @@ def train(weights=None):
         model.load_weights(weights, strict=False)
 
     dataset = load_dataset("openai/gsm8k", "main")["train"]
-    dataset.shuffle()
+    dataset = dataset.shuffle()
+    
     for i in range(0, len(model.layers), len(model.layers) // gradient_checkpoints):
         grad_checkpoint(model.layers[i])
 
-    run = wandb.init()
+    run = wandb.init(config = {
+            'max_tokens': max_tokens,
+            'epsilon': epsilon,
+            'beta': beta,
+            'temperature': temperature,
+            'batch_size': batch_size,
+            'generations': generations,
+            'learning_rate': learning_rate,
+            'mu': mu,
+        }
+    )
+
     value_and_grad_fn = nn.value_and_grad(model, grpo_loss)
 
     for step in range(0, 500, batch_size):
+        if (step // batch_size) % 10 == 0:
+            evaluate(ref_model, model, dataset, tokenizer, generations, range(step, step + batch_size))
         print("Generating rollout")
         gens, avg_reward = create_generations(
             model,
@@ -264,37 +328,20 @@ def train(weights=None):
         print("Average Reward: ", avg_reward.item())
         run.log({"avg_reward": avg_reward.item()})
 
-        for _ in range(mu):
-            total_loss = 0
-            for j in range(gradient_accumulation_steps):
-                indices = mx.arange(generations * batch_size).reshape(
-                    generations * batch_size // gradient_accumulation_steps,
-                    gradient_accumulation_steps,
-                )
-                # Save Memory Accumulate Gradients
-                accumulated_grads = None
-                loss, grads = value_and_grad_fn(
-                    model,
-                    gens["tokens"][indices[j], :],
-                    gens["response_mask"][indices[j], :],
-                    gens["advantages"][indices[j]],
-                    gens["ref_log_probs"][indices[j], :],
-                    gradient_accumulation_steps,
-                )
-                total_loss += loss
-                if accumulated_grads:
-                    grads = tree_flatten(grads)
-                    accumulated_grads = [
-                        (k1, v1 + v2)
-                        for (k1, v1), (k1, v2) in zip(grads, accumulated_grads)
-                    ]
-                else:
-                    accumulated_grads = tree_flatten(grads)
-                mx.eval(model.parameters(), grads)
-            run.log({"loss": total_loss.item()})
-            print("loss: ", total_loss.item())
-            optimizer.update(model.parameters(), tree_unflatten(accumulated_grads))
-            mx.eval(model.parameters(), optimizer.state)
+        loss, grads = value_and_grad_fn(
+            model,
+            gens["tokens"],
+            gens["response_mask"],
+            gens["attention_mask"],
+            gens["advantages"],
+            gens["ref_log_probs"]
+        )
+        mx.eval(model.parameters(), grads)
+        run.log({"loss": loss.item()})
+        print("loss: ", loss.item())
+        clipped_grads, _total_norm = optim.clip_grad_norm(grads, max_norm=gradient_clipping)
+        optimizer.update(model, clipped_grads)
+        mx.eval(model.parameters(), optimizer.state)
 
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(safetensor_file, adapter_weights)
