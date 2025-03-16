@@ -1,5 +1,4 @@
 import re
-import math
 import wandb
 import mlx.core as mx
 import mlx.nn as nn
@@ -202,7 +201,7 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
         attention_mask[start:end, :, 0:p] = -1000000000
     attention_mask = mx.expand_dims(attention_mask, 1)
     # num_heads
-    attention_mask = mx.repeat(attention_mask, 12, 1)
+    attention_mask = mx.repeat(attention_mask, model.args.num_attention_heads, 1)
     attention_mask = attention_mask.astype(mx.bfloat16)
 
     logits = ref_model(full_prompts, mask=attention_mask)
@@ -349,7 +348,7 @@ def train(weights=None):
 
     value_and_grad_fn = nn.value_and_grad(model, grpo_loss)
 
-    for step in range(65, 500, batch_size):
+    for step in range(0, 500, batch_size):
         if (step // batch_size) % 10 == 0:
             evaluate(
                 ref_model,
