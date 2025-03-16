@@ -19,7 +19,7 @@ batch_size = 2
 generations = 16
 learning_rate = 5e-6
 gradient_checkpoints = 1
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 1
 gradient_clipping = 0.1
 safetensor_file = "qwen-rl.safetensors"
 
@@ -27,34 +27,29 @@ optimizer = optim.AdamW(
     learning_rate=learning_rate, betas=[0.9, 0.95], weight_decay=0.1
 )
 
-system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
-The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
-<answer> answer here </answer>
+system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant creates an equation for a calculator to solve.
+The assistant first thinks about the reasoning process in the mind and then provides the user with an arithmetic equation with no answer. Use * as multiplication. The reasoning process and arithmatic are enclosed within <think> </think> and <calculator> </calculator> tags, respectively, i.e., <think> reasoning process here </think>
+<calculator> arithmatic here </calculator>
 """
 
 
 def format_reward(text, _answer):
     think_count = text.count("<think>")
-    answer_count = text.count("<answer>")
+    answer_count = text.count("<calculator>")
     has_correct_structure = think_count == 1 and answer_count == 1
-    pattern = r"^.*?<think>.*?</think>.*?<answer>.*?</answer>.*?$"
+    pattern = r"^.*?<think>.*?</think>.*?<calculator>.*?</calculator>.*?$"
     matches_format = bool(re.search(pattern, text, re.DOTALL))
 
     return 0.5 if (has_correct_structure and matches_format) else -0.5
 
 
 def answer_reward(text, answer):
-    match = re.search(rf"<answer>\s*(.*?)\s*</answer>", text, re.DOTALL)
-    return (
-        1
-        if match and match.group(1).strip() == answer
-        else 0.5 if match and answer in match.group(1).strip() else 0
-    )
-
-
-def digit_reward(text, _answer):
-    match = re.search(rf"<answer>\s*(.*?)\s*</answer>", text, re.DOTALL)
-    return 0.25 if match and match.group(1).strip().isdigit() else 0
+    match = re.search(rf"<calculator>\s*(.*?)\s*</calculator>", text, re.DOTALL)
+    try:
+        evaled = eval(match.group(1).strip())
+        return 1.0 if evaled == answer else 0.5
+    except:
+        return 0.0
 
 
 def sample(logits, temp, top_p):
@@ -178,7 +173,6 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
         [
             format_reward(response.split("<|im_end|>")[0], answer)
             + answer_reward(response.split("<|im_end|>")[0], answer)
-            + digit_reward(response.split("<|im_end|>")[0], answer)
             for response, answer in zip(decoded, answers)
         ]
     ).reshape(len(prompts) // generations, generations)
@@ -202,7 +196,7 @@ def create_generations(model, ref_model, tokenizer, dataset, generations, indice
         attention_mask[start:end, :, 0:p] = -1000000000
     attention_mask = mx.expand_dims(attention_mask, 1)
     # num_heads
-    attention_mask = mx.repeat(attention_mask, 12, 1)
+    attention_mask = mx.repeat(attention_mask, model.args.num_attention_heads, 1)
     attention_mask = attention_mask.astype(mx.bfloat16)
 
     logits = ref_model(full_prompts, mask=attention_mask)
@@ -276,14 +270,6 @@ def generate_evaluation(model, dataset, tokenizer, generations, indices):
             ]
         )
     ).item()
-    digit = mx.mean(
-        mx.array(
-            [
-                digit_reward(response.split("<|im_end|>")[0], answer)
-                for response, answer in zip(decoded, answers)
-            ]
-        )
-    ).item()
     answer = mx.mean(
         mx.array(
             [
@@ -292,7 +278,7 @@ def generate_evaluation(model, dataset, tokenizer, generations, indices):
             ]
         )
     ).item()
-    return format + digit + answer, format, digit, answer
+    return format + answer, format, answer
 
 
 def evaluate(ref_model, model, dataset, tokenizer, generations, indices):
